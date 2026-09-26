@@ -601,3 +601,85 @@ class CostAllocationOut(BaseModel):
     items: list[ItemCostOut] = Field(
         ..., description="每件器物的费用汇总，按器物编号升序"
     )
+
+
+class InspectionSampleIn(BaseModel):
+    """单件器物的质检抽样输入。"""
+
+    item_id: str = Field(..., min_length=1, description="器物编号（非空字符串）")
+    risk_score: int = Field(
+        ..., strict=True, ge=0, description="该器物的非负风险分"
+    )
+    inspection_minutes: int = Field(
+        ..., strict=True, ge=1, description="检验该器物所需分钟数（正整数）"
+    )
+
+    @field_validator("item_id")
+    @classmethod
+    def _strip_and_check(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("器物编号不得为空白字符串")
+        return v
+
+
+class InspectionSampleRequest(BaseModel):
+    """成品质检抽样请求：器物编号必须完整且唯一地覆盖原方案全部器物。"""
+
+    samples: list[InspectionSampleIn] = Field(
+        ...,
+        min_length=1,
+        max_length=14,
+        description="按方案全部器物编号逐件给出风险分与检验分钟数，不得缺漏或重复",
+    )
+    total_minute_budget: int = Field(
+        ..., strict=True, ge=0, description="总检验分钟预算（非负整数）"
+    )
+
+    @model_validator(mode="after")
+    def _unique_item_ids(self):
+        seen: set[str] = set()
+        dup: list[str] = []
+        for s in self.samples:
+            if s.item_id in seen and s.item_id not in dup:
+                dup.append(s.item_id)
+            seen.add(s.item_id)
+        if dup:
+            raise ValueError(
+                "器物编号不得重复，重复编号: " + ", ".join(dup)
+            )
+        return self
+
+
+class InspectionKilnCoverageOut(BaseModel):
+    """一个窑次的质检抽样覆盖明细。"""
+
+    kiln_index: int = Field(..., description="窑次序号（从 1 开始）")
+    item_count: int = Field(..., description="该窑器物总数（取自原方案）")
+    sampled_count: int = Field(..., description="该窑抽中器物数（至少 1 件）")
+    sampled_item_ids: list[str] = Field(
+        ..., description="抽中器物编号，按编号升序"
+    )
+    risk_score: int = Field(..., description="该窑抽中器物风险分合计")
+    inspection_minutes: int = Field(
+        ..., description="该窑抽中器物检验分钟合计"
+    )
+
+
+class InspectionSampleOut(BaseModel):
+    """成品质检抽样结果（只读计算，不改写原方案）。"""
+
+    plan_id: str = Field(..., description="原方案 ID")
+    kiln_count: int = Field(..., description="窑次数（与原方案一致）")
+    total_minute_budget: int = Field(..., description="请求的总分钟预算")
+    sampled_count: int = Field(..., description="抽中器物数")
+    sampled_item_ids: list[str] = Field(
+        ..., description="抽中器物编号，按编号升序"
+    )
+    total_risk_score: int = Field(..., description="抽中器物风险分总和（最大化目标）")
+    total_inspection_minutes: int = Field(
+        ..., description="抽中器物检验分钟总和（不超过预算，并列时最小）"
+    )
+    kiln_coverages: list[InspectionKilnCoverageOut] = Field(
+        ..., description="各窑覆盖明细，按窑次序号升序"
+    )
