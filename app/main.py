@@ -14,6 +14,7 @@ POST /plans/{plan_id}/kilns/{index}/shelf-placement
                                            窑内层位安排：器物与层位一一分配，最大化最小温差
 POST /plans/{plan_id}/firing-order       单台实体窑点火排程：全部批次不逾期的最早整体完工
 POST /plans/{plan_id}/cost-allocation    烧成费用分摊：每窑按器物体积比例（受上限约束）分摊费用
+POST /plans/{plan_id}/inspection-sample  成品质检抽样：预算内每窑至少一件，最大化风险分总和
 GET  /health                             健康检查
 """
 
@@ -31,6 +32,11 @@ from .firing import (
     FiringBatch,
     NoFeasibleFiringOrderError,
     earliest_firing_schedule,
+)
+from .inspection import (
+    InspectionItem,
+    NoFeasibleInspectionSampleError,
+    select_inspection_sample,
 )
 from .shelf_placement import (
     NoFeasibleShelfPlacementError,
@@ -54,6 +60,10 @@ from .schemas import (
     FiringOrderOut,
     GlazeSeparationIn,
     GlazeSeparationOut,
+    InspectionSampleIn,
+    InspectionSampleItemOut,
+    InspectionSampleOut,
+    KilnInspectionOut,
     KilnOut,
     KilnPairOut,
     PlanCompareIn,
@@ -136,6 +146,16 @@ def _no_feasible_shelf_placement_handler(
     return JSONResponse(
         status_code=400,
         content={"error": "NO_FEASIBLE_SHELF_PLACEMENT", "message": str(exc)},
+    )
+
+
+@app.exception_handler(NoFeasibleInspectionSampleError)
+def _no_feasible_inspection_sample_handler(
+    _: Request, exc: NoFeasibleInspectionSampleError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=400,
+        content={"error": "NO_FEASIBLE_INSPECTION_SAMPLE", "message": str(exc)},
     )
 
 
@@ -1056,5 +1076,107 @@ def cost_allocation(plan_id: str, payload: CostAllocationIn) -> CostAllocationOu
                 share=s.share,
             )
             for s in item_shares
+        ],
+    )
+
+
+@app.post(
+    "/plans/{plan_id}/inspection-sample",
+    response_model=InspectionSampleOut,
+    tags=["plans"],
+    responses={
+        400: {
+            "model": ErrorOut,
+            "description": "器物编号未完整覆盖 / 预算内无可行覆盖",
+        },
+        404: {"model": ErrorOut, "description": "方案不存在"},
+    },
+    summary="成品质检抽样：预算内每窑至少抽中一件，最大化风险分总和",
+)
+def inspection_sample(
+    plan_id: str, payload: InspectionSampleIn
+) -> InspectionSampleOut:
+    plan = database.get_plan(plan_id)
+    if plan is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "PLAN_NOT_FOUND",
+                "message": f"未找到排程方案: {plan_id}",
+            },
+        )
+
+    original_ids = {it["item_id"] for it in plan["items"]}
+    unknown = sorted({it.item_id for it in payload.items} - original_ids)
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "UNKNOWN_ITEM_ID",
+                "message": f"以下器物编号不属于原方案: {', '.join(unknown)}",
+            },
+        )
+    covered = {it.item_id for it in payload.items}
+    missing = sorted(original_ids - covered)
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "MISSING_ITEM_INSPECTION",
+                "message": (
+                    "质检参数必须覆盖原方案全部器物，缺少编号: "
+                    + ", ".join(missing)
+                ),
+            },
+        )
+
+    # 只读计算：以方案保存的窑次明细为准，结合请求的风险分与检验分钟数
+    # 抽样，不改写原方案；预算内无可行覆盖时 inspection 模块抛出
+    # NoFeasibleInspectionSampleError，由全局处理器返回 400。
+    kilns_sorted = sorted(plan["kilns"], key=lambda k: k["index"])
+    result = select_inspection_sample(
+        [k["item_ids"] for k in kilns_sorted],
+        [
+            InspectionItem(
+                item_id=it.item_id,
+                risk_score=it.risk_score,
+                inspect_minutes=it.inspect_minutes,
+            )
+            for it in payload.items
+        ],
+        payload.budget_minutes,
+    )
+
+    param_by_id = {it.item_id: it for it in payload.items}
+    kiln_index_by_item = {
+        item_id: k["index"]
+        for k in plan["kilns"]
+        for item_id in k["item_ids"]
+    }
+
+    return InspectionSampleOut(
+        plan_id=plan["id"],
+        budget_minutes=payload.budget_minutes,
+        kiln_count=plan["kiln_count"],
+        sample_count=len(result.sampled_item_ids),
+        sampled_item_ids=list(result.sampled_item_ids),
+        total_risk_score=result.total_risk_score,
+        total_inspect_minutes=result.total_inspect_minutes,
+        kilns=[
+            KilnInspectionOut(
+                kiln_index=k.kiln_index,
+                sampled_item_ids=list(k.sampled_item_ids),
+                sampled_count=len(k.sampled_item_ids),
+            )
+            for k in result.kilns
+        ],
+        items=[
+            InspectionSampleItemOut(
+                item_id=item_id,
+                kiln_index=kiln_index_by_item[item_id],
+                risk_score=param_by_id[item_id].risk_score,
+                inspect_minutes=param_by_id[item_id].inspect_minutes,
+            )
+            for item_id in result.sampled_item_ids
         ],
     )

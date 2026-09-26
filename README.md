@@ -11,7 +11,10 @@
 求全部批次均不逾期时的最早整体完工），**烧成费用分摊**
 （每窑独立按器物体积比例、受单件收费上限约束，用精确有理数分费后按余数补齐），
 以及**窑内层位安排**（提交与该窑器物等数、带整数温度偏移的层位，求器物与层位
-一一分配使到原温区最近边界的最小温差最大，并列取层位编号序列字典序最小）。
+一一分配使到原温区最近边界的最小温差最大，并列取层位编号序列字典序最小），
+还有**成品质检抽样**（按方案全部器物提交非负风险分、正整数检验分钟数与总分钟
+预算，在预算内选出每窑至少抽中一件的样本，先最大化风险分总和、再最小化耗时、
+最后取编号升序列表字典序最小）。
 
 技术栈：Python 3.12 · FastAPI · SQLite · Uvicorn。
 
@@ -881,6 +884,102 @@ curl -s -X POST http://localhost:8000/plans/9c05e113e3e0430eb552a0bd01036dbb/kil
 - `422`：请求参数非法（层位编号重复 / 为空白字符串 / 列表为空或超过
   14 个 / 温度偏移非整数 / 缺少字段等）。
 
+### 13. 成品质检抽样（预算内每窑至少一件，最大化风险分总和）
+
+`POST http://localhost:8000/plans/{id}/inspection-sample`
+
+成品出窑前需抽检。针对**已保存**的方案，按**方案全部器物编号**逐件提交
+**非负风险分**与**正整数检验分钟数**，并给出**总分钟预算**；编号必须
+**完整且唯一**（恰好覆盖方案全部器物，不多不少）。服务在**只读**前提下
+选出一份抽样集合：
+
+- 抽中器物的检验分钟数之和**不超过总分钟预算**；
+- **每个窑次至少抽中一件**器物；
+- 在全部可行集合中按优先级择优：
+  1. **风险分总和最大**；
+  2. **总检验耗时最小**；
+  3. 仍并列时，取**抽中编号升序列表字典序最小**者（标准字符串字典序，
+     前缀视为更小）。
+
+返回抽中编号、**各窑覆盖明细**、总风险分与总耗时。**只读计算，不改写原方案。**
+
+请求体：
+
+```json
+{
+  "budget_minutes": 25,
+  "items": [
+    {"item_id": "p1", "risk_score": 5, "inspect_minutes": 10},
+    {"item_id": "p2", "risk_score": 9, "inspect_minutes": 7},
+    {"item_id": "p3", "risk_score": 4, "inspect_minutes": 3},
+    {"item_id": "p4", "risk_score": 6, "inspect_minutes": 8}
+  ]
+}
+```
+
+字段约束：`items` 数量 1～14；器物编号请求内**不重复**且**恰好覆盖方案
+全部器物**；`risk_score` 为**非负整数**；`inspect_minutes` 为**正整数**；
+`budget_minutes` 为**非负整数**。
+
+curl 示例（沿用第 1 节方案 `[p1] [p2,p3] [p4]`）：
+
+```bash
+curl -s -X POST http://localhost:8000/plans/9c05e113e3e0430eb552a0bd01036dbb/inspection-sample \
+  -H 'Content-Type: application/json' \
+  -d '{"budget_minutes": 25, "items": [{"item_id": "p1", "risk_score": 5, "inspect_minutes": 10}, {"item_id": "p2", "risk_score": 9, "inspect_minutes": 7}, {"item_id": "p3", "risk_score": 4, "inspect_minutes": 3}, {"item_id": "p4", "risk_score": 6, "inspect_minutes": 8}]}'
+```
+
+成功响应 `200 OK`：
+
+```json
+{
+  "plan_id": "9c05e113e3e0430eb552a0bd01036dbb",
+  "budget_minutes": 25,
+  "kiln_count": 3,
+  "sample_count": 3,
+  "sampled_item_ids": ["p1", "p2", "p4"],
+  "total_risk_score": 20,
+  "total_inspect_minutes": 25,
+  "kilns": [
+    {"kiln_index": 1, "sampled_item_ids": ["p1"], "sampled_count": 1},
+    {"kiln_index": 2, "sampled_item_ids": ["p2"], "sampled_count": 1},
+    {"kiln_index": 3, "sampled_item_ids": ["p4"], "sampled_count": 1}
+  ],
+  "items": [
+    {"item_id": "p1", "kiln_index": 1, "risk_score": 5, "inspect_minutes": 10},
+    {"item_id": "p2", "kiln_index": 2, "risk_score": 9, "inspect_minutes": 7},
+    {"item_id": "p4", "kiln_index": 3, "risk_score": 6, "inspect_minutes": 8}
+  ]
+}
+```
+
+上例中三个窑次各须抽中一件：窑 1 只有 `p1`（10 分钟）、窑 3 只有 `p4`
+（8 分钟），共占 18 分钟；窑 2 中 `p2`（7 分钟、风险 9）较 `p3`
+（3 分钟、风险 4）风险更高，预算 25 恰好容纳 `p1 + p2 + p4`，
+风险分总和 20 为预算内最大值。若预算为 21～24，则窑 2 只能选 `p3`，
+返回 `["p1", "p3", "p4"]`（风险 15、耗时 21）。
+
+预算**低于覆盖全部窑次的最低耗时**（各窑最低单件检验分钟数之和，
+本例为 `10 + 3 + 8 = 21` 分钟）时无可行覆盖，返回明确业务错误，
+且**不改写方案**：
+
+```json
+{
+  "error": "NO_FEASIBLE_INSPECTION_SAMPLE",
+  "message": "总分钟预算 20 内不存在覆盖全部 3 个窑次的抽样方案: 每个窑次至少抽中一件所需最低耗时为 21 分钟"
+}
+```
+
+错误情况：
+
+- `400` `NO_FEASIBLE_INSPECTION_SAMPLE`：预算内不存在覆盖全部窑次的抽样
+  集合，响应体说明预算与覆盖全部窑次所需的最低耗时；
+- `400` `UNKNOWN_ITEM_ID`：存在不属于原方案的器物编号，响应体列出全部非法编号；
+- `400` `MISSING_ITEM_INSPECTION`：质检参数未完整覆盖全部器物，响应体列出缺少编号；
+- `404` `PLAN_NOT_FOUND`：方案不存在；
+- `422`：请求参数非法（编号重复 / 为空白字符串 / 列表为空或超过
+  14 个 / 风险分为负 / 检验分钟数非正 / 预算为负 / 缺少字段等）。
+
 ## 本地开发（不使用 Docker）
 
 ```bash
@@ -889,7 +988,7 @@ pip install -r requirements.txt
 KILN_DB_PATH=./kiln.db uvicorn app.main:app --reload
 ```
 
-运行求解器、温控核验、点火排程、费用分摊与层位安排测试（无需第三方依赖，含随机用例的暴力枚举交叉验证）：
+运行求解器、温控核验、点火排程、费用分摊、层位安排与质检抽样测试（无需第三方依赖，含随机用例的暴力枚举交叉验证）：
 
 ```bash
 python3 tests/test_solver.py
@@ -897,6 +996,7 @@ python3 tests/test_tempcheck.py
 python3 tests/test_firing.py
 python3 tests/test_cost_allocation.py
 python3 tests/test_shelf_placement.py
+python3 tests/test_inspection.py
 ```
 
 ## 算法说明（n ≤ 14）
@@ -1014,6 +1114,15 @@ DP `can[mask]` 表示层位集合 `mask` 能否恰好匹配给按编号升序的
 最小。二分约 `log n²` 轮、每轮 `n·2ⁿ` 级状态，`n = 14` 时典型耗时在
 1 秒以内。
 
+`inspection-sample` 接口的成品质检抽样：器物总数 `n ≤ 14`，枚举全部
+`2ⁿ` 个器物子集，用「去掉最低位 + 一件」递推每个子集的总耗时、风险分
+总和与窑次覆盖位掩码，在「覆盖集满全部窑次且总耗时不超过预算」的子集中
+按「风险分总和最大 → 总耗时最小 → 抽中编号升序列表字典序最小」三级键
+取最优（编号升序与位序一致，第三级直接比较编号元组即可）。各窑器物互不
+相交，任何可行集合耗时不低于各窑最低单件耗时之和，而每窑各取一件最低
+耗时器物即达此界——预算低于该和时无可行覆盖，报错信息直接给出该最低
+耗时。计算量与求解器同为 `2ⁿ` 级，`n = 14` 时可忽略不计。
+
 ## 目录结构
 
 ```
@@ -1023,6 +1132,7 @@ app/
   firing.py         # 点火排程：两轮位掩码 DP 求不逾期的最早整体完工（纯函数）
   cost_allocation.py  # 烧成费用分摊：精确有理数水位法 + 余数补齐（纯函数）
   shelf_placement.py  # 窑内层位安排：后缀位掩码 DP 最大化最小温差（纯函数）
+  inspection.py     # 成品质检抽样：子集递推 + 三级键择优（纯函数）
   database.py       # SQLite 初始化与读写
   schemas.py        # Pydantic 请求/响应模型
   main.py           # FastAPI 路由
@@ -1032,6 +1142,7 @@ tests/
   test_firing.py
   test_cost_allocation.py
   test_shelf_placement.py
+  test_inspection.py
 entrypoint.sh   # 安装依赖 → 初始化数据库 → 启动服务
 Dockerfile
 docker-compose.yml
